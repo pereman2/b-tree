@@ -6,6 +6,8 @@ use std::{
     ptr::swap,
 };
 
+use rand::Rng;
+
 const PageSize: usize = 128;
 const Empty: usize = 999999999;
 type PageId = usize;
@@ -112,7 +114,9 @@ impl MemPage {
 struct Pager {
     file: File,
     free_list: Vec<PageId>,
+    file_size: usize,
 }
+
 impl Pager {
     pub fn new() -> Self {
         Self {
@@ -120,9 +124,11 @@ impl Pager {
                 .create(true)
                 .read(true)
                 .write(true)
+                .truncate(true)
                 .open("pere.db")
                 .unwrap(),
             free_list: Vec::new(),
+            file_size: 0,
         }
     }
 
@@ -131,13 +137,14 @@ impl Pager {
             self.free_list.pop().unwrap()
         } else {
             self.file.seek(SeekFrom::End(0));
-            let page_id = self.file.metadata().unwrap().len() as usize / PageSize;
+            let page_id = self.file_size as usize / PageSize;
             self.file.write(&vec![0; PageSize]).unwrap();
+            self.file_size += PageSize;
             page_id
         }
     }
 
-    pub fn read(&mut self, page_id: PageId) -> MemPage {
+    pub fn read(&self, page_id: PageId) -> MemPage {
         let mut buf = vec![0; PageSize];
         self.file
             .read_at(buf.as_mut_slice(), (page_id * PageSize) as u64)
@@ -149,6 +156,13 @@ impl Pager {
         self.file
             .write_at(page.as_buf().as_slice(), (page_id * PageSize) as u64)
             .unwrap();
+        self.file.flush().unwrap();
+    }
+
+    pub fn close(&mut self) {
+        self.file.flush().unwrap();
+        self.file.set_len(0).unwrap();
+        self.file.flush().unwrap();
     }
 }
 
@@ -223,10 +237,8 @@ impl Btree {
             }
 
             // remove keys from left page
-            while page.keys.len() > m {
-                page.keys.pop();
-                page.values.pop();
-            }
+            page.keys.truncate(m);
+            page.values.truncate(m);
             if self.root == cur {
                 let new_root = self.pager.allocate_page();
                 self.root = new_root;
@@ -234,7 +246,7 @@ impl Btree {
                 root_page.t = MemPageType::Inner;
                 right.parent = new_root;
                 page.parent = new_root;
-                root_page.keys.push(m);
+                root_page.keys.push(m_key);
                 root_page.pointers.push(cur);
                 root_page.pointers.push(right_id);
                 self.pager.write(cur, &page);
@@ -259,18 +271,20 @@ impl Btree {
 
     pub fn insert_internal(&mut self, key: usize, page_id: usize, child_id: usize) {
         let mut page = self.pager.read(page_id);
+        println!("insert {} internal page {:?}", key, page);
         if page.keys.len() < self.max_keys() {
             let mut i = 0;
-            while key > page.keys[i] && i < page.keys.len() {
+            while i < page.keys.len() && key > page.keys[i] {
                 i += 1;
             }
             page.keys.insert(i, key);
             // insert and shift to right other pointers
             page.pointers.insert(i + 1, child_id);
             println!("after insert internal {:?}", page);
+            self.pager.write(page_id, &page);
         } else {
             let mut i = 0;
-            while key > page.keys[i] && i < page.keys.len() {
+            while i < page.keys.len() && key > page.keys[i] {
                 i += 1;
             }
             page.keys.insert(i, key);
@@ -283,7 +297,7 @@ impl Btree {
             let mut right_page = MemPage::new();
             right_page.parent = page.parent;
 
-            // move keys, here m is not included like in elaf
+            // move keys, here m is not included like in leaf
             for i in m + 1..page.keys.len() {
                 right_page.keys.push(page.keys[i]);
             }
@@ -301,14 +315,62 @@ impl Btree {
                 self.pager.write(*p, &child_page);
             }
             println!("after insert split internal {:?}", page);
-            println!("        m {:?}", m_key);
             println!("        right {:?}", right_page);
-            self.insert_internal(m_key, page.parent, right);
+            println!("        m {:?}", m_key);
+            if page_id == self.root {
+                // if page was root before splitting, then create a new root
+                let new_root = self.pager.allocate_page();
+                let mut page_root = MemPage::new();
+                page_root.t = MemPageType::Inner;
+                page_root.keys.push(m_key);
+                page_root.pointers.push(page_id);
+                page_root.pointers.push(right);
+                self.root = new_root;
+                page.parent = new_root;
+                right_page.parent = new_root;
+
+                self.pager.write(right, &right_page);
+                self.pager.write(page_id, &page);
+                self.pager.write(new_root, &page_root);
+            } else {
+                self.pager.write(right, &right_page);
+                self.pager.write(page_id, &page);
+                self.insert_internal(m_key, page.parent, right);
+            }
         }
     }
 
     pub fn get(&self, key: usize) -> usize {
-        0
+        println!("get {}", key);
+        let mut cur = self.root;
+        let mut cur_page = self.pager.read(cur);
+        while !cur_page.is_leaf() {
+            println!("cur page {:?}", cur_page);
+            let mut i = 0;
+            while i < cur_page.keys.len() {
+                if key < cur_page.keys[i] {
+                    break;
+                }
+                i += 1;
+            }
+            cur = cur_page.pointers[i];
+            cur_page = self.pager.read(cur);
+        }
+        println!("cur page {:?}", cur_page);
+        let mut i = 0;
+        while i < cur_page.keys.len() {
+            if key == cur_page.keys[i] {
+                break;
+            }
+            i += 1;
+        }
+        if i == cur_page.keys.len() {
+            println!("not found");
+            0
+        } else {
+            println!("got values {}", cur_page.values[i]);
+            cur_page.values[i]
+        }
     }
 
     pub fn delete(&mut self, key: usize) {}
@@ -324,6 +386,9 @@ impl Btree {
     fn max_keys(&self) -> usize {
         (self.min_degree * 2) - 1
     }
+    pub fn close(&mut self) {
+        self.pager.close();
+    }
 }
 
 fn main() {
@@ -334,17 +399,49 @@ fn main() {
     b.insert(4, 4);
 }
 
+// #[test]
+// fn test_mem_page() {
+//     let mut m = MemPage::new();
+//     m.keys.push(2);
+//     m.values.push(3);
+//     m.values.push(4);
+//     m.pointers.push(5);
+//     for (i, v) in m.as_buf().iter().enumerate() {
+//         if i % 8 == 0 {
+//             println!();
+//         }
+//         print!("{:?} ", v);
+//     }
+// }
+
+// #[test]
+// fn test_btree() {
+//     let mut b = Btree::new(2);
+//     b.insert(1, 1);
+//     b.insert(2, 2);
+//     b.insert(3, 3);
+//     b.insert(4, 4);
+//     debug_assert!(b.get(4) == 4);
+//     debug_assert!(b.get(3) == 3);
+//     debug_assert!(b.get(2) == 2);
+//     debug_assert!(b.get(1) == 1);
+//     b.close();
+// }
+
 #[test]
-fn test_mem_page() {
-    let mut m = MemPage::new();
-    m.keys.push(2);
-    m.values.push(3);
-    m.values.push(4);
-    m.pointers.push(5);
-    for (i, v) in m.as_buf().iter().enumerate() {
-        if i % 8 == 0 {
-            println!();
-        }
-        print!("{:?} ", v);
+fn test_btree_hard() {
+    let mut b = Btree::new(2);
+    let l = 50;
+    let mut rng = rand::thread_rng();
+    let mut values = Vec::new();
+    for i in 0..l {
+        let v = rng.gen();
+        dbg!(v);
+        values.push(v);
+        b.insert(v, v);
     }
+    for value in values {
+        debug_assert!(b.get(value) == value);
+    }
+    b.close();
 }
