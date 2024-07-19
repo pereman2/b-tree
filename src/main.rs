@@ -215,6 +215,18 @@ impl Btree {
 
         let mut move_key = key;
         let mut move_value = data;
+        let mut overwrite = false;
+        for i in 0..page.keys.len() {
+            if (page.keys[i] == key) {
+                overwrite = true;
+                page.values[i] = data;
+                break;
+            }
+        }
+        if overwrite {
+            self.pager.write(cur, &page);
+            return;
+        }
         for i in 0..page.keys.len() {
             if move_key < page.keys[i] {
                 (page.keys[i], move_key) = (move_key, page.keys[i]);
@@ -435,7 +447,8 @@ fn test_btree_hard() {
     let mut rng = rand::thread_rng();
     let mut values = Vec::new();
     for i in 0..l {
-        let v = rng.gen();
+        let v: usize = rng.gen();
+        let v = v % 200;
         dbg!(v);
         values.push(v);
         b.insert(v, v);
@@ -445,3 +458,12 @@ fn test_btree_hard() {
     }
     b.close();
 }
+
+// #[test]
+// fn test_btree_twice() {
+//     let mut b = Btree::new(2);
+//     b.insert(1, 1);
+//     b.insert(1, 2);
+//     debug_assert!(b.get(1) == 2);
+//     b.close()
+// }
